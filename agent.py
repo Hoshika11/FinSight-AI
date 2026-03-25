@@ -1,19 +1,16 @@
 import math
 import time
-import openai
-import tiktoken
+
 import random
-import requests
-import google.generativeai as genai
+from google import genai
 
 import util
 from log.custom_logger import log
 
 from prompt.agent_prompt import *
-from procoder.functional import format_prompt
-from procoder.prompt import *
 from secretary import Secretary
 from stock import Stock
+
 
 
 def random_init(stock_a_initial, stock_b_initial):
@@ -67,62 +64,57 @@ class Agent:
         self.quit = False
 
     def run_api(self, prompt, temperature: float = 1):
-        if 'gpt' in self.model:
-            return self.run_api_gpt(prompt, temperature)
-        elif 'gemini' in self.model:
-            return self.run_api_gemini(prompt, temperature)
-
-    def run_api_gemini(self, prompt, temperature: float = 1):
-        genai.configure(api_key=util.GOOGLE_API_KEY, transport='rest')
-        generation_config = genai.types.GenerationConfig(
-            candidate_count=1,
-            temperature=temperature)
-        model = genai.GenerativeModel(self.model)
-        self.chat_history.append({"role": "user", "parts": [prompt]})
-        max_retry = 2
-        retry = 0
-        while retry < max_retry:
-            try:
-                response = model.generate_content(contents=self.chat_history, generation_config=generation_config)
-                new_message_dict = {"role": 'model', "parts": [response.text]}
-                self.chat_history.append(new_message_dict)
-                return response.text
-            except Exception as e:
-                log.logger.warning("Gemini api retry...{}".format(e))
-                retry += 1
-                time.sleep(1)
-        log.logger.error("ERROR: GEMINI API FAILED. SKIP THIS INTERACTION.")
-        return ""
-
-
+        return self.run_api_gpt(prompt, temperature)
+    
     def run_api_gpt(self, prompt, temperature: float = 1):
-        openai.api_key = util.OPENAI_API_KEY
-        client = openai.OpenAI(api_key=openai.api_key)
+        import util
+        import time
+        from google import genai
+        import json
+        client = genai.Client(api_key=util.GOOGLE_API_KEY)
+
+        
         self.chat_history.append({"role": "user", "content": prompt})
         max_retry = 2
         retry = 0
-
-        # just cut off the overflow tokens
-        # tokens = encoding.encode(self.chat_history)
-
         while retry < max_retry:
             try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=self.chat_history,
-                    temperature=temperature,
-                )
-                new_message_dict = {"role": response.choices[0].message.role,
-                                    "content": response.choices[0].message.content}
-                self.chat_history.append(new_message_dict)
-                resp = response.choices[0].message.content
-                return resp
-            except openai.OpenAIError as e:
-                log.logger.warning("OpenAI api retry...{}".format(e))
+                full_prompt = ""
+                for msg in self.chat_history:
+                    full_prompt += f"{msg['role'].upper()}: {msg['content']}\n"
+
+                response = client.models.generate_content(
+                model=self.model,
+                contents=full_prompt
+            )
+                reply = response.text.strip()
+                clean_reply = reply.strip().strip("```json").strip("```")
+                import json
+                try:
+                     data = json.loads(reply)  # try to parse JSON
+                except json.JSONDecodeError:
+                     log.logger.warning(f"Wrong json content in response: {reply}")
+                     data = {}  # fallback to empty dict or default response
+                self.chat_history = self.chat_history[-10:]
+
+                self.chat_history.append({
+                     "role": "assistant",
+                     "content": reply
+                     })
+                return reply
+            except Exception as e:
                 retry += 1
-                time.sleep(1)
-        log.logger.error("ERROR: OPENAI API FAILED. SKIP THIS INTERACTION.")
-        return ""
+                if hasattr(e, 'details'):
+                   for detail in getattr(e, 'details', []):
+                       if isinstance(detail, dict) and '@type' in detail:
+                           if 'RetryInfo' in detail.get('@type', ''):
+                               log.logger.error("Gemini quota exceeded. Skipping this request.")
+                               return ""   
+                           else:
+                               log.logger.warning(f"Gemini API retry... {e}")
+                               time.sleep(1)
+                log.logger.error("ERROR: GEMINI API FAILED. SKIP THIS INTERACTION.")
+                return ""
 
     def get_total_proper(self, stock_a_price, stock_b_price):
         return self.stock_a_amount * stock_a_price + self.stock_b_amount * stock_b_price + self.cash
@@ -138,185 +130,98 @@ class Agent:
         for loan in self.loans:
             debt += loan["amount"]
         return debt
-
     def plan_loan(self, date, stock_a_price, stock_b_price, lastday_forum_message):
         if self.quit:
             return {"loan": "no"}
-        # first day action : prompt with background
-        if date == 1:
-            prompt = Collection(BACKGROUND_PROMPT,
-                                LOAN_TYPE_PROMPT,
-                                DECIDE_IF_LOAN_PROMPT).set_indexing_method(sharp2_indexing).set_sep("\n")
-            max_loan = self.init_proper - self.get_total_loan()
-            inputs = {
-                'date': date,
-                'character': self.character,
-                'stock_a': self.stock_a_amount,
-                'stock_b': self.stock_b_amount,
-                'cash': self.cash,
-                'debt': self.loans,
-                'max_loan': max_loan,
-                'loan_rate1': util.LOAN_RATE[0],
-                'loan_rate2': util.LOAN_RATE[1],
-                'loan_rate3': util.LOAN_RATE[2],
-            }
-
-        # other days action : prompt with last day forum message & stock price
-        else:
-            prompt = Collection(BACKGROUND_PROMPT,
-                                LASTDAY_FORUM_AND_STOCK_PROMPT,
-                                LOAN_TYPE_PROMPT,
-                                DECIDE_IF_LOAN_PROMPT).set_indexing_method(sharp2_indexing).set_sep("\n")
-            max_loan = self.init_proper - self.get_total_loan()
-            inputs = {
-                "date": date,
-                "character": self.character,
-                "stock_a": self.stock_a_amount,
-                "stock_b": self.stock_b_amount,
-                "cash": self.cash,
-                "debt": self.loans,
-                "max_loan": max_loan,
-                "stock_a_price": stock_a_price,
-                "stock_b_price": stock_b_price,
-                "lastday_forum_message": lastday_forum_message,
-                'loan_rate1': util.LOAN_RATE[0],
-                'loan_rate2': util.LOAN_RATE[1],
-                'loan_rate3': util.LOAN_RATE[2],
-            }
+        max_loan = self.init_proper - self.get_total_loan()
         if max_loan <= 0:
             return {"loan": "no"}
-        try_times = 0
-        MAX_TRY_TIMES = 3
-        resp = self.run_api(format_prompt(prompt, inputs))
-        # print(resp)
+        inputs = {
+        "date": date,
+        "character": self.character,
+        "stock_a": self.stock_a_amount,
+        "stock_b": self.stock_b_amount,
+        "cash": self.cash,
+        "debt": self.loans,
+        "max_loan": max_loan,
+        "loan_type_prompt": LOAN_TYPE_PROMPT,  # use prompt from agent_prompt.py
+        "stock_a_price": stock_a_price,
+        "stock_b_price": stock_b_price,
+        "lastday_forum_message": lastday_forum_message,
+        "loan_rate1": util.LOAN_RATE[0],
+        "loan_rate2": util.LOAN_RATE[1],
+        "loan_rate3": util.LOAN_RATE[2],
+    }
+        prompt_text = format_prompt(DECIDE_IF_LOAN_PROMPT, inputs)
+        resp = self.run_api(prompt_text)
         if resp == "":
             return {"loan": "no"}
-
-        loan_format_check, fail_response, loan = self.secretary.check_loan(resp,
-                                                                           max_loan)  # secretary check loan format
+        loan_format_check, fail_response, loan = self.secretary.check_loan(resp, max_loan)
+        try_times = 0
+        MAX_TRY_TIMES = 3
         while not loan_format_check:
-            # log.logger.debug("WARNING: Loan format check failed because of these issues: {}".format(fail_response))
             try_times += 1
             if try_times > MAX_TRY_TIMES:
                 log.logger.warning("WARNING: Loan format try times > MAX_TRY_TIMES. Skip as no loan today.")
                 loan = {"loan": "no"}
                 break
-
             resp = self.run_api(format_prompt(LOAN_RETRY_PROMPT, {"fail_response": fail_response}))
-            if resp == "":
-                return {"loan": "no"}
-            loan_format_check, fail_response, loan = self.secretary.check_loan(date, resp)
-
-        if loan["loan"] == "yes":
-            loan["repayment_date"] = date + util.LOAN_TYPE_DATE[loan["loan_type"]]  # add loan repayment_date
+            loan_format_check, fail_response, loan = self.secretary.check_loan(resp, max_loan)
+        if loan_format_check and loan.get("loan") == "yes":
+            loan["repayment_date"] = date + util.LOAN_TYPE_DATE[loan["loan_type"]]
             self.loans.append(loan)
-            #self.action_history[date].append(loan)
             self.cash += loan["amount"]
-            log.logger.info("INFO: Agent {} decide to loan: {}".format(self.order, loan))
+            log.logger.info(f"INFO: Agent {self.order} decide to loan: {loan}")
         else:
-            log.logger.info("INFO: Agent {} decide not to loan".format(self.order))
+            loan = {"loan": "no"}
+            log.logger.info(f"INFO: Agent {self.order} decide not to loan")
         return loan
+
+
+ 
 
     # date=交易日, time=当前交易时段
     # 设置
+    
     def plan_stock(self, date, time, stock_a, stock_b, stock_a_deals, stock_b_deals):
         if self.quit:
             return {"action_type": "no"}
+        inputs = {
+        "date": date,
+        "time": time,
+        "stock_a": self.stock_a_amount,
+        "stock_b": self.stock_b_amount,
+        "stock_a_price": stock_a.get_price(),
+        "stock_b_price": stock_b.get_price(),
+        "stock_a_deals": stock_a_deals,
+        "stock_b_deals": stock_b_deals,
+        "cash": self.cash
+    }
         if date in util.SEASON_REPORT_DAYS and time == 1:
             index = util.SEASON_REPORT_DAYS.index(date)
-            prompt = Collection(FIRST_DAY_FINANCIAL_REPORT, FIRST_DAY_BACKGROUND_KNOWLEDGE, SEASONAL_FINANCIAL_REPORT,
-                                DECIDE_BUY_STOCK_PROMPT).set_indexing_method(sharp2_indexing).set_sep("\n")
-            inputs = {
-                "date": date,
-                "time": time,
-                "stock_a": self.stock_a_amount,
-                "stock_b": self.stock_b_amount,
-                "stock_a_price": stock_a.get_price(),
-                "stock_b_price": stock_b.get_price(),
-                "stock_a_deals": stock_a_deals,
-                "stock_b_deals": stock_b_deals,
-                "cash": self.cash,
-                "stock_a_report": stock_a.gen_financial_report(index),
-                "stock_b_report": stock_b.gen_financial_report(index)
-            }
-        elif time == 1:
-            prompt = Collection(FIRST_DAY_FINANCIAL_REPORT, FIRST_DAY_BACKGROUND_KNOWLEDGE,
-                                DECIDE_BUY_STOCK_PROMPT).set_indexing_method(sharp2_indexing).set_sep("\n")
-            inputs = {
-                "date": date,
-                "time": time,
-                "stock_a": self.stock_a_amount,
-                "stock_b": self.stock_b_amount,
-                "stock_a_price": stock_a.get_price(),
-                "stock_b_price": stock_b.get_price(),
-                "stock_a_deals": stock_a_deals,
-                "stock_b_deals": stock_b_deals,
-                "cash": self.cash
-            }
+            inputs["stock_a_report"] = stock_a.gen_financial_report(index)
+            inputs["stock_b_report"] = stock_b.gen_financial_report(index)
+            prompt_text = format_prompt(DECIDE_BUY_STOCK_PROMPT, inputs)
         else:
-            prompt = DECIDE_BUY_STOCK_PROMPT
-            inputs = {
-                "date": date,
-                "time": time,
-                "stock_a": self.stock_a_amount,
-                "stock_b": self.stock_b_amount,
-                "stock_a_price": stock_a.get_price(),
-                "stock_b_price": stock_b.get_price(),
-                "stock_a_deals": stock_a_deals,
-                "stock_b_deals": stock_b_deals,
-                "cash": self.cash
-            }
-
-
-        try_times = 0
-        MAX_TRY_TIMES = 3
-        resp = self.run_api(format_prompt(prompt, inputs))
-        # print(resp)
+            prompt_text = format_prompt(DECIDE_BUY_STOCK_PROMPT, inputs)
+        resp = self.run_api(prompt_text)
         if resp == "":
             return {"action_type": "no"}
-
         action_format_check, fail_response, action = self.secretary.check_action(
-            resp, self.cash, self.stock_a_amount, self.stock_b_amount, stock_a.get_price(), stock_b.get_price())
-        while not action_format_check:
-            # log.logger.debug("Action format check failed because of these issues: {}".format(fail_response))
+                resp, self.cash, self.stock_a_amount, self.stock_b_amount, stock_a.get_price(), stock_b.get_price()
+                )
+        try_times = 0
+        MAX_TRY_TIMES = 3
+        while not action_format_check and try_times < MAX_TRY_TIMES:
             try_times += 1
-            if try_times > MAX_TRY_TIMES:
-                log.logger.warning("WARNING: Action format try times > MAX_TRY_TIMES. Skip as no loan today.")
-                action = {"action_type": "no"}
-                break
-
             resp = self.run_api(format_prompt(BUY_STOCK_RETRY_PROMPT, {"fail_response": fail_response}))
-            if resp == "":
-                return {"action_type": "no"}
             action_format_check, fail_response, action = self.secretary.check_action(
-                resp, self.cash, self.stock_a_amount, self.stock_b_amount, stock_a.get_price(), stock_b.get_price())
-
-        if action["action_type"] == "buy":
-            #self.action_history[date].append(action)
-            log.logger.info("INFO: Agent {} decide to action: {}".format(self.order, action))
-            # if action["stock"] == "stock_a":
-            #     self.stock_a_amount += action["amount"]
-            #     self.cash -= action["amount"] * stock_a.get_price()
-            # else:
-            #     self.stock_b_amount += action["amount"]
-            #     self.cash -= action["amount"] * stock_b.get_price()
-            return action
-        elif action["action_type"] == "sell":
-            #self.action_history[date].append(action)
-            log.logger.info("INFO: Agent {} decide to action: {}".format(self.order, action))
-            # if action["stock"] == "stock_a":
-            #     self.stock_a_amount -= action["amount"]
-            #     self.cash += action["amount"] * stock_a.get_price()
-            # else:
-            #     self.stock_b_amount -= action["amount"]
-            #     self.cash += action["amount"] * stock_b.get_price()
-            return action
-        elif action["action_type"] == "no":
-            log.logger.info("INFO: Agent {} decide not to action".format(self.order))
-            return action
-
-        log.logger.error("ERROR: WRONG ACTION: {}".format(action))
-        return {"action_type": "no"}
+                resp, self.cash, self.stock_a_amount, self.stock_b_amount, stock_a.get_price(), stock_b.get_price()
+            )
+        if not action_format_check:
+            return {"action_type": "no"}
+        log.logger.info(f"INFO: Agent {self.order} decide action: {action}")
+        return action
 
     def buy_stock(self, stock_name, price, amount):
         if self.quit:

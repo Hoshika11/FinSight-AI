@@ -203,6 +203,8 @@ def simulation(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="gemini-pro", help="model name")
+    parser.add_argument("--model", type=str,default="models/gemini-flash-latest"
+
+, help="model name")
     args = parser.parse_args()
     simulation(args)

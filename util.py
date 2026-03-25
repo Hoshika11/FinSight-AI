@@ -1,9 +1,9 @@
 """
 DONT FORGET TO DELETE!!!
 """
-OPENAI_API_KEY = ""
-GOOGLE_API_KEY = ""
 
+GOOGLE_API_KEY = "AIzaSyCRDS01QM4wq9o-NQBguvWxkAX-h9sc0oE"
+OPENAI_API_KEY = ""
 # 基础设置
 AGENTS_NUM = 50  # 交易员数量
 TOTAL_DATE = 264   # 模拟时长
